@@ -20,9 +20,9 @@ import os
 
 def segment_players(season="20/21"):
     try:
-        if not os.path.exists("no_nans_data.xlsx"):
+        if not os.path.exists("no_nans_data1.xlsx"):
             raise FileNotFoundError("The data file 'no_nans_data.xlsx' was not found.")
-        df = pd.read_excel("no_nans_data.xlsx")
+        df = pd.read_excel("no_nans_data1.xlsx")
     except FileNotFoundError as e:
         print(e)
         return pd.DataFrame()
