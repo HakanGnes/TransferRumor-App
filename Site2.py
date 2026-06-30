@@ -13,13 +13,22 @@ def load_data():
     """
     Loads all the necessary data for the application.
     """
-    df_main = pd.read_excel(DATA_PATH, sheet_name="Sheet1")
+    try:
+        df_main = pd.read_excel(DATA_PATH, sheet_name="Sheet1")
+    except FileNotFoundError:
+        st.error(f"The main data file '{DATA_PATH}' was not found. Please make sure the file exists.")
+        st.stop()
+        
     df_main = df_main.drop_duplicates()
     df_main.columns = df_main.columns.str.upper()
     df_main[['CLUB', 'POSITION']] = df_main[['CLUB', 'POSITION']].applymap(lambda x: x.upper())
 
     df_19_20 = segment_players("19/20")
     df_20_21 = segment_players("20/21")
+
+    if df_19_20.empty or df_20_21.empty:
+        st.error("Could not load player segmentation data. Please make sure the 'no_nans_data.xlsx' file exists and is in the correct format.")
+        st.stop()
 
     # Merge the dataframes
     df = pd.merge(df_main, df_19_20, on="PLAYER", how="left")
