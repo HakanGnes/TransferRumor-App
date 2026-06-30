@@ -7,3 +7,4 @@ openpyxl==3.0.10
 pydotplus
 graphviz
 seaborn
+skompiler
