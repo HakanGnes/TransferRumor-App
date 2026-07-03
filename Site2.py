@@ -1,108 +1,172 @@
 import streamlit as st
+import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from yellowbrick.cluster import KElbowVisualizer
 from player_segmentation import segment_players
+from data_loader import load_players, get_available_seasons
 import joblib
 
-DATA_PATH = "./no_nans_data1.xlsx"
+# Excel yerine artik SQLite DB'den (fetch_api_football_data.py tarafindan
+# doldurulur) canli olarak okunuyor. DATA_PATH kaldirildi.
+#
+# NOT: yellowbrick'in KElbowVisualizer'i guncel scikit-learn surumleriyle
+# uyumsuz hale geldi (estimator tip kontrolu hata veriyor: "not a clustering
+# estimator"). Bu yuzden yellowbrick bagimliligi tamamen kaldirildi; elbow
+# (dirsek) noktasi asagida birkac satirlik sade bir fonksiyonla (Kneedle
+# yontemi - ilk/son noktayi birlestiren dogruya en uzak nokta) hesaplaniyor.
+
+
+def _find_elbow_k(k_values, inertias):
+    """Basit 'kneedle' yontemi: ilk-son noktayi birlestiren dogruya en uzak k."""
+    if len(k_values) <= 2:
+        return k_values[0]
+    x1, y1 = k_values[0], inertias[0]
+    x2, y2 = k_values[-1], inertias[-1]
+    denom = ((y2 - y1) ** 2 + (x2 - x1) ** 2) ** 0.5
+    if denom == 0:
+        return k_values[0]
+    distances = [
+        abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1) / denom
+        for x, y in zip(k_values, inertias)
+    ]
+    return k_values[int(np.argmax(distances))]
+
+
+def _non_feature_columns(seasons):
+    """KMeans'e sokulmayacak kimlik + segmentasyon metin sutunlari (sezona gore degisir)."""
+    cols = ["PLAYER", "CLUB", "NATION", "VALUE", "POSITION", "LEAGUE"]
+    for s in seasons:
+        cols += [
+            f"SEGMENT_{s}",
+            f"SALES_EXPECTATION_PRICE_{s}",
+            f"RECOMMEND_FOR_ACTION_{s}",
+        ]
+    return cols
+
 
 @st.cache_data
 def load_data():
     """
-    Loads all the necessary data for the application.
+    SQLite'taki (api_football_data.db) en guncel sezonu ana veri, DB'de
+    bulunan TUM sezonlari da segmentasyon icin kullanarak birlestirilmis
+    DataFrame'i olusturur.
     """
-    try:
-        df_main = pd.read_excel(DATA_PATH, sheet_name="Sheet1")
-    except FileNotFoundError:
-        st.error(f"The main data file '{DATA_PATH}' was not found. Please make sure the file exists.")
-        st.stop()
-        
-    df_main = df_main.drop_duplicates()
-    df_main.columns = df_main.columns.str.upper()
-    df_main[['CLUB', 'POSITION']] = df_main[['CLUB', 'POSITION']].applymap(lambda x: x.upper())
-
-    df_19_20 = segment_players("19/20")
-    df_20_21 = segment_players("20/21")
-
-    if df_19_20.empty or df_20_21.empty:
-        st.error("Could not load player segmentation data. Please make sure the 'no_nans_data.xlsx' file exists and is in the correct format.")
+    seasons = get_available_seasons()
+    if not seasons:
+        st.error(
+            "SQLite veritabaninda (api_football_data.db) hic veri bulunamadi. "
+            "Once fetch_api_football_data.py scriptini calistirip veri cek."
+        )
         st.stop()
 
-    # Merge the dataframes
-    df = pd.merge(df_main, df_19_20, on="PLAYER", how="left")
-    df = pd.merge(df, df_20_21, on="PLAYER", how="left")
+    latest_season = seasons[0]
+    df_main = load_players(latest_season)
+    if df_main.empty:
+        st.error(f"En guncel sezon ({latest_season}) icin oyuncu verisi bulunamadi.")
+        st.stop()
+    df_main = df_main.drop_duplicates(subset=["PLAYER", "CLUB"])
 
-    return df
+    df = df_main
+    for season in seasons:
+        df_season = segment_players(season)
+        if df_season.empty:
+            continue
+        df = pd.merge(df, df_season, on="PLAYER", how="left")
 
-def get_kmeans_model(position, dataframe):
+    return df, seasons
+
+
+def get_kmeans_model(position, dataframe, non_feature_columns):
     model_path = f"kmeans_{position.lower()}.joblib"
     try:
         kmeans = joblib.load(model_path)
     except FileNotFoundError:
-        if position == "ATTACK":
-            data = dataframe[dataframe['POSITION'] == 'ATTACK']
-            X = data.drop(["PLAYER", "CLUB", "NATION", "VALUE", "POSITION", "LEAGUE"], axis=1, errors='ignore').values
-        elif position == "MIDFIELD":
-            data = dataframe[dataframe['POSITION'] == 'MIDFIELD']
-            X = data.drop(["PLAYER", "CLUB", "NATION", "VALUE", "POSITION", "LEAGUE"], axis=1, errors='ignore').values
-        else:
-            data = dataframe[dataframe['POSITION'] == 'DEFENDER']
-            X = data.drop(["PLAYER", "CLUB", "NATION", "VALUE", "POSITION", "LEAGUE"], axis=1, errors='ignore').values
+        data = dataframe[dataframe["POSITION"] == position]
+        X = data.drop(non_feature_columns, axis=1, errors="ignore").values
 
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
-        kmeans = KMeans(random_state=17)
-        elbow = KElbowVisualizer(kmeans, k=(2, 20))
-        elbow.fit(X_scaled)
-        kmeans = KMeans(n_clusters=elbow.elbow_value_, random_state=17).fit(X_scaled)
+
+        max_k = min(20, len(X_scaled) - 1)
+        if max_k < 3:
+            # Cok az oyuncu var (nadir durum); sabit kucuk bir k kullan.
+            best_k = max(2, min(max_k, 2))
+        else:
+            k_values = list(range(2, max_k + 1))
+            inertias = []
+            for k in k_values:
+                km = KMeans(n_clusters=k, random_state=17, n_init=10).fit(X_scaled)
+                inertias.append(km.inertia_)
+            best_k = _find_elbow_k(k_values, inertias)
+
+        kmeans = KMeans(n_clusters=best_k, random_state=17, n_init=10).fit(X_scaled)
         joblib.dump(kmeans, model_path)
     return kmeans
 
-def ilgilenilebilecek_oyuncular(dataframe):
+
+def ilgilenilebilecek_oyuncular(dataframe, non_feature_columns):
     st.header("Transfer Player Prediction")
     takim = st.sidebar.selectbox("Team:", dataframe["CLUB"].unique())
     pozisyon = st.sidebar.selectbox("Position:", dataframe["POSITION"].unique())
     yas = st.sidebar.slider("Age Range:", min_value=16, max_value=40, key="yas_slider")
-    deger = st.sidebar.slider("Value Range:",min_value=0, max_value=150000000,step=100000,key="deger_slider")
+
+    value_available = dataframe["VALUE"].notna().any()
+    if value_available:
+        deger = st.sidebar.slider("Value Range:", min_value=0, max_value=150000000, step=100000, key="deger_slider")
+    else:
+        st.sidebar.info(
+            "Piyasa degeri (Value) bilgisi API-Football ucretsiz planinda bulunmuyor, "
+            "bu filtre devre disi."
+        )
+        deger = None
 
     if st.sidebar.button("Get Predictions🔍"):
-        kmeans = get_kmeans_model(pozisyon, dataframe)
-        
-        position_df = dataframe[dataframe['POSITION'] == pozisyon].copy()
-        
-        X = position_df.drop(["PLAYER", "CLUB", "NATION", "VALUE", "POSITION", "LEAGUE"], axis=1, errors='ignore').values
-        
+        kmeans = get_kmeans_model(pozisyon, dataframe, non_feature_columns)
+
+        position_df = dataframe[dataframe["POSITION"] == pozisyon].copy()
+
+        X = position_df.drop(non_feature_columns, axis=1, errors="ignore").values
+
         position_df["CLUSTER"] = kmeans.predict(StandardScaler().fit_transform(X))
         position_df["CLUSTER"] = position_df["CLUSTER"] + 1
-        
-        transfer_edilebilecekler = position_df.loc[(position_df["POSITION"] == pozisyon) & (position_df["AGE"] <= yas) & (position_df["VALUE"] <= deger) & (position_df["CLUB"] != takim) & (position_df["CLUSTER"] == round(position_df.loc[position_df["CLUB"] == takim, "CLUSTER"].mean()))]
+
+        target_cluster = round(position_df.loc[position_df["CLUB"] == takim, "CLUSTER"].mean())
+        mask = (
+            (position_df["POSITION"] == pozisyon)
+            & (position_df["AGE"] <= yas)
+            & (position_df["CLUB"] != takim)
+            & (position_df["CLUSTER"] == target_cluster)
+        )
+        if value_available:
+            mask &= position_df["VALUE"] <= deger
+
+        transfer_edilebilecekler = position_df.loc[mask]
 
         st.write(transfer_edilebilecekler[["PLAYER", "CLUB", "POSITION", "AGE", "VALUE"]])
 
 
-def oyuncu_kazanc_beklentisi(dataframe):
+def oyuncu_kazanc_beklentisi(dataframe, seasons):
     st.header("Sales Expectation and Performance Analysis")
     takim2 = st.sidebar.selectbox("Team: ", dataframe["CLUB"].unique()).upper()
-    season = st.sidebar.selectbox("Season:", ["20/21", "19/20"])
-    
+    season = st.sidebar.selectbox("Season:", [str(s) for s in seasons])
+
     if st.sidebar.button("Get Predictions🔍"):
-        segment_col = f"SEGMENT{season.replace('/', '_')}"
-        performance_score_col = f"PERFORMANCE_SCORE_{season.replace('/', '_')}"
-        sales_exp_col = "SALES_EXPECTATION_PRICE_x" if season == "20/21" else "SALES_EXPECTATION_PRICE_y"
-        
+        segment_col = f"SEGMENT_{season}"
+        performance_score_col = f"PERFORMANCE_SCORE_{season}"
+        sales_exp_col = f"SALES_EXPECTATION_PRICE_{season}"
+
         oyuncu_sonuc = dataframe[dataframe["CLUB"] == takim2][["PLAYER", sales_exp_col, segment_col, performance_score_col]]
         st.write(oyuncu_sonuc)
 
 
-def oyunculara_göre_aksiyon_tavsiyesi(dataframe):
+def oyunculara_göre_aksiyon_tavsiyesi(dataframe, seasons):
     st.header("Recommendation for Action")
-    takim2 = st.sidebar.selectbox("Team: ", dataframe["CLUB"].unique())
-    season = st.sidebar.selectbox("Season:", ["20/21", "19/20"])
-    
+    takim2 = st.sidebar.selectbox("Team: ", dataframe["CLUB"].unique()).upper()
+    season = st.sidebar.selectbox("Season:", [str(s) for s in seasons])
+
     if st.sidebar.button("Get Recommendations🔍"):
-        recommendation_col = "RECOMMEND_FOR_ACTION_x" if season == "20/21" else "RECOMMEND_FOR_ACTION_y"
+        recommendation_col = f"RECOMMEND_FOR_ACTION_{season}"
         takim_df = dataframe.loc[(dataframe["CLUB"] == takim2), ["PLAYER", "CLUB", "AGE", "POSITION", recommendation_col]]
         st.write(takim_df)
 
@@ -111,19 +175,23 @@ def main():
     new_title = '<p style="font-family:algerian; color:White; font-size: 55px;">TRANSFER RUMOR⚽️</p>'
     st.markdown(new_title, unsafe_allow_html=True)
 
-    df = load_data()
+    df, seasons = load_data()
+    non_feature_columns = _non_feature_columns(seasons)
 
-    selected_option = st.sidebar.radio("Choose Your Action:", ("Transfer Player Prediction", "Sales Expectation and Performance Analysis", "Recommendation for Action"))
+    selected_option = st.sidebar.radio(
+        "Choose Your Action:",
+        ("Transfer Player Prediction", "Sales Expectation and Performance Analysis", "Recommendation for Action"),
+    )
 
     if selected_option == "Transfer Player Prediction":
-        ilgilenilebilecek_oyuncular(df)
+        ilgilenilebilecek_oyuncular(df, non_feature_columns)
     elif selected_option == "Sales Expectation and Performance Analysis":
-        oyuncu_kazanc_beklentisi(df)
+        oyuncu_kazanc_beklentisi(df, seasons)
     else:
-        oyunculara_göre_aksiyon_tavsiyesi(df)
+        oyunculara_göre_aksiyon_tavsiyesi(df, seasons)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
 page_bg_img = f"""
